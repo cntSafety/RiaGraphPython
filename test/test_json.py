@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import builtins
+import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from type_aliases import ConnDB
+
+
+def test_to_json_string_param_roundtrip(conn_db_empty: ConnDB) -> None:
+    """to_json() with a JSON string parameter should store the parsed object, not a string literal."""
+    conn, _ = conn_db_empty
+    conn.execute("""
+        INSTALL json;
+        LOAD json;
+        CREATE NODE TABLE User (id SERIAL PRIMARY KEY, meta JSON);
+        """)
+
+    data = {
+        "id": "http://localhost:8000/actors/testuser",
+        "ap_data": {
+            "id": "http://localhost:8000/actors/testuser",
+            "type": "Person",
+            "name": "",
+            "summary": "",
+            "username": "testuser",
+            "inbox": "http://localhost:8000/actors/testuser/inbox",
+            "outbox": "http://localhost:8000/actors/testuser/outbox",
+            "public_key": {
+                "id": "http://localhost:8000/actors/testuser#main-key",
+                "owner": "http://localhost:8000/actors/testuser",
+                "public_key_pem": (
+                    "-----BEGIN PUBLIC KEY-----\n"
+                    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAni2p5Ni2mVmHKFlOFA5w\n"
+                    "zBLTZS3cEdiQ/IBqeSKYcKU4TFEhaFaVy3Be4pL+vFwX+iEXpvAznEhaC6oTU2zC\n"
+                    "EaXFhmVInsZ3kzrz2vTeXsOIwJ4auR8fFziwewXYXUgT0/KmSlNaYMz1PbXxPS+P\n"
+                    "DHL7E6ovJSau8Hj7UMDpF6W0Xty8PoU/Kw9Fyt3SXBHz6h5hvNXTiqS2HxWDbtz/\n"
+                    "j5tZlpvxiZ/sFN2w/bsotlbe2QOF5HuLA/w7B3E1Tan8jLNO4qXEHffdUZEl92ad\n"
+                    "dqnhsH9MJbRp6YfNnRMd1NaHu+rDUjTur34r5oVEz766oU/ZnGlGpJsvaQmUiMW8\n"
+                    "XQIDAQAB\n"
+                    "-----END PUBLIC KEY-----\n"
+                ),
+            },
+            "manually_approve_followers": False,
+            "@context": [
+                "https://www.w3.org/ns/activitystreams",
+                "https://w3id.org/security/v1",
+                {"manuallyApprovesFollowers": "as:manuallyApprovesFollowers"},
+            ],
+        },
+        "is_local": True,
+        "created_at": "2026-02-25T00:54:29.987623Z",
+    }
+
+    response = conn.execute(
+        """
+        CREATE (n:User {meta: to_json($meta)})
+        RETURN n.id as id, cast(n.meta AS STRING) as meta;
+        """,
+        parameters={"meta": json.dumps(data)},
+    )
+
+    response_data = json.loads(response.rows_as_dict().get_all()[0]["meta"])
+    assert response_data == data
+
+
+def test_to_json_python_param_with_empty_nested_list(conn_db_empty: ConnDB) -> None:
+    conn, _ = conn_db_empty
+    conn.execute("""
+        CREATE NODE TABLE User (id SERIAL PRIMARY KEY, meta JSON);
+        """)
+
+    data = {"tags": []}
+
+    response = conn.execute(
+        """
+        CREATE (n:User {meta: to_json($meta)})
+        RETURN n.id as id, cast(n.meta AS STRING) as meta;
+        """,
+        parameters={"meta": data},
+    )
+
+    response_data = json.loads(response.rows_as_dict().get_all()[0]["meta"])
+    assert response_data == data
+
+
+def test_to_json_python_param_with_mixed_nested_list(conn_db_empty: ConnDB) -> None:
+    conn, _ = conn_db_empty
+    conn.execute("""
+        INSTALL json;
+        LOAD json;
+        CREATE NODE TABLE User (id SERIAL PRIMARY KEY, meta JSON);
+        """)
+
+    data = {
+        "@context": [
+            "entry1",
+            "entry2",
+            {"key": "value"},
+        ],
+    }
+
+    response = conn.execute(
+        """
+        CREATE (n:User {meta: to_json($meta)})
+        RETURN n.id as id, cast(n.meta AS STRING) as meta;
+        """,
+        parameters={"meta": data},
+    )
+
+    response_data = json.loads(response.rows_as_dict().get_all()[0]["meta"])
+    assert response_data == data
+
+
+def test_to_json_mixed_nested_list_normalization_does_not_import_numpy(
+    conn_db_empty: ConnDB,
+    monkeypatch,
+) -> None:
+    conn, _ = conn_db_empty
+    query = "CREATE (n:User {meta: to_json($meta)})"
+    data = {"@context": ["entry1", "entry2", {"key": "value"}]}
+    parameters = {"meta": data}
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "numpy" or name.startswith("numpy."):
+            msg = "JSON parameter normalization should not import NumPy"
+            raise AssertionError(msg)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    normalized_query, normalized_parameters = conn._normalize_parameters_for_pybind(
+        query,
+        parameters,
+    )
+    assert normalized_query.startswith("CREATE (n:User {meta: CAST(")
+    assert normalized_query.endswith(" AS JSON)})")
+    assert normalized_parameters == {}
+
+
+def test_to_json_python_param_with_homogeneous_list_uses_typed_binding(
+    conn_db_empty: ConnDB,
+) -> None:
+    conn, _ = conn_db_empty
+    query = "CREATE (n:User {meta: to_json($meta)})"
+    parameters = {"meta": {"tags": [1, 2, 3]}}
+
+    normalized_query, normalized_parameters = conn._normalize_parameters_for_pybind(
+        query,
+        parameters,
+    )
+
+    assert normalized_query == query
+    assert normalized_parameters == parameters
+
+
+def test_get_as_df_json_scalar(conn_db_empty: ConnDB) -> None:
+    """
+    Scalar JSON values convert through get_as_df() as Python strings.
+
+    Covers non-null values, typed JSON nulls, and a mixed column in a single query.
+    """
+    conn, _ = conn_db_empty
+    df = conn.execute(
+        "UNWIND ["
+        'CAST(\'{"a": 1, "b": [2, 3]}\' AS JSON), '
+        "CAST(NULL AS JSON), "
+        "CAST('[1, 2, 3]' AS JSON)"
+        "] AS j RETURN j"
+    ).get_as_df()
+
+    assert str(df["j"].dtype) == "object"
+    assert df["j"].isna().tolist() == [False, True, False]
+
+    first = df["j"].iloc[0]
+    assert isinstance(first, str)
+    assert json.loads(first) == {"a": 1, "b": [2, 3]}
+
+    third = df["j"].iloc[2]
+    assert isinstance(third, str)
+    assert json.loads(third) == [1, 2, 3]
+
+
+def test_get_as_df_json_empty_result(conn_db_empty: ConnDB) -> None:
+    """
+    An empty result over a JSON column builds the column without crashing.
+
+    convertToArrayType() runs during NPArrayWrapper construction, before any
+    rows are iterated, so a zero-row JSON result is the minimal reproduction
+    for the original dtype-selection crash.
+    """
+    conn, _ = conn_db_empty
+    conn.execute("CREATE NODE TABLE t (id SERIAL PRIMARY KEY, data JSON)")
+
+    df = conn.execute("MATCH (n:t) RETURN n.data AS data").get_as_df()
+
+    assert len(df) == 0
+    assert str(df["data"].dtype) == "object"
+
+
+def test_get_as_df_json_extract(conn_db_empty: ConnDB) -> None:
+    """json_extract() produces a scalar JSON result that converts via get_as_df()."""
+    conn, _ = conn_db_empty
+    conn.execute("INSTALL json; LOAD json;")
+    conn.execute("CREATE NODE TABLE t (id SERIAL PRIMARY KEY, data JSON)")
+
+    data = {"name": {"first": "Alice", "last": "Smith"}}
+    conn.execute(
+        "CREATE (n:t {data: to_json($data)})",
+        parameters={"data": json.dumps(data)},
+    )
+
+    df = conn.execute(
+        "MATCH (n:t) RETURN json_extract(n.data, '$.name') AS name"
+    ).get_as_df()
+
+    assert str(df["name"].dtype) == "object"
+    val = df["name"].iloc[0]
+    assert isinstance(val, str)
+    assert json.loads(val) == {"first": "Alice", "last": "Smith"}
+
+
+def test_get_as_df_json_list(conn_db_empty: ConnDB) -> None:
+    """JSON[] (LIST of JSON) columns keep their existing pandas behavior."""
+    conn, _ = conn_db_empty
+    conn.execute("INSTALL json; LOAD json;")
+    conn.execute("CREATE NODE TABLE t (id SERIAL PRIMARY KEY, data JSON[])")
+
+    data = [{"x": 1}, {"x": 2}, {"x": 3}]
+    conn.execute("CREATE (n:t {data: $d})", parameters={"d": data})
+
+    df = conn.execute("MATCH (n:t) RETURN n.data AS data").get_as_df()
+
+    assert str(df["data"].dtype) == "object"
+    val = df["data"].iloc[0]
+    assert isinstance(val, list)
+    assert len(val) == 3
+    assert all(isinstance(e, str) for e in val)

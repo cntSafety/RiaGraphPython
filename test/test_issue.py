@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import pytest
+
+try:
+    from tools.python_api.test.type_aliases import ConnDB
+except ImportError:
+    from type_aliases import ConnDB
+
+# required by python-lint
+
+
+def test_param_empty(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    lst = [[]]
+    conn.execute("CREATE NODE TABLE tab(id SERIAL, lst INT64[][], PRIMARY KEY(id))")
+    result = conn.execute("CREATE (t:tab {lst: $1}) RETURN t.*", {"1": lst})
+    assert result.has_next()
+    assert result.get_next() == [0, lst]
+    assert not result.has_next()
+    result.close()
+
+
+def test_issue_2874(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    result = conn.execute(
+        "UNWIND $idList as tid MATCH (t:person {ID: tid}) RETURN t.fName;",
+        {"idList": [1, 2, 3]},
+    )
+    assert result.has_next()
+    assert result.get_next() == ["Bob"]
+    assert result.has_next()
+    assert result.get_next() == ["Carol"]
+    assert not result.has_next()
+    result.close()
+
+
+def test_issue_2906(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    result = conn.execute(
+        "MATCH (a:person) WHERE $1 > a.ID AND $1 < a.age / 5 RETURN a.fName;", {"1": 6}
+    )
+    assert result.has_next()
+    assert result.get_next() == ["Alice"]
+    assert result.has_next()
+    assert result.get_next() == ["Carol"]
+    assert not result.has_next()
+    result.close()
+
+
+def test_issue_3135(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    conn.execute("CREATE NODE TABLE t1(id SERIAL, number INT32, PRIMARY KEY(id));")
+    conn.execute("CREATE (:t1 {number: $1})", {"1": 2})
+    result = conn.execute("MATCH (n:t1) RETURN n.number;")
+    assert result.has_next()
+    assert result.get_next() == [2]
+    assert not result.has_next()
+    result.close()
+
+
+def test_empty_list2(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    conn.execute("""
+        CREATE NODE TABLE SnapArtifactScan (
+            artifact_name STRING,
+            scan_columns STRING[],
+            scan_filter STRING,
+            scan_limit INT64,
+            scan_id STRING,
+            PRIMARY KEY(scan_id)
+        )
+        """)
+    result = conn.execute(
+        """
+        MERGE (n:SnapArtifactScan { scan_id: $scan_id })
+        SET n.artifact_name = $artifact_name, n.scan_columns = $scan_columns
+        RETURN n.scan_id
+    """,
+        {
+            "artifact_name": "taxi_zones",
+            "scan_columns": [],
+            "scan_id": "896de6b9c7b69fa2598def49e8c61de07949be374d229a82899c9c75994fad20",
+        },
+    )
+    assert result.has_next()
+    assert result.get_next() == [
+        "896de6b9c7b69fa2598def49e8c61de07949be374d229a82899c9c75994fad20"
+    ]
+    assert not result.has_next()
+    result.close()
+
+
+def test_empty_map(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    conn.execute("""
+        CREATE NODE TABLE Test (
+            id SERIAL,
+            prop1 MAP(STRING, STRING),
+            prop2 MAP(STRING, STRING[]),
+            PRIMARY KEY(id)
+        )
+        """)
+    result = conn.execute(
+        """
+            CREATE (n:Test {prop1: $prop1, prop2: $prop2})
+            RETURN n.id, n.prop1, n.prop2
+        """,
+        {
+            "prop1": {"key": [], "value": []},
+            "prop2": {"key": ["a"], "value": [[]]},
+        },
+    )
+    assert result.has_next()
+    assert result.get_next() == [0, {}, {"a": []}]
+    assert not result.has_next()
+    result.close()
+
+
+def test_int8_type_sniffing(conn_db_readwrite: ConnDB) -> None:
+    conn, _ = conn_db_readwrite
+    conn.execute("CREATE NODE TABLE Chunk(id INT64, PRIMARY KEY(id))")
+
+    conn.execute("CREATE (c:Chunk {id:259})")
+
+    result = conn.execute(
+        "MATCH (node:Chunk) WHERE node.id IN $chunk_ids RETURN node.id",
+        {"chunk_ids": [1]},
+    )
+    assert result.get_num_tuples() == 0
+    result.close()
+
+
+def test_issue_483_numpy_ndarray_parameter(conn_db_readwrite: ConnDB) -> None:
+    np = pytest.importorskip("numpy")
+
+    conn, _ = conn_db_readwrite
+    conn.execute("CREATE NODE TABLE T(id INT64, v FLOAT[3], PRIMARY KEY(id))")
+    conn.execute("CREATE (:T {id: 1})")
+
+    arr = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    result = conn.execute(
+        "MATCH (n:T {id: 1}) SET n.v = $v RETURN n.v",
+        {"v": arr},
+    )
+
+    assert result.has_next()
+    assert result.get_next() == [
+        [pytest.approx(0.1), pytest.approx(0.2), pytest.approx(0.3)]
+    ]
+    assert not result.has_next()
+    result.close()
+
+
+def test_issue_866_repeated_parameterized_write_then_vector_read(
+    conn_db_readwrite: ConnDB,
+) -> None:
+    # https://github.com/LadybugDB/ladybug/issues/866  # riag-rename:skip upstream provenance
+    # Re-executing the same parameterized write query string through the implicit
+    # prepared-statement cache takes the cached-physical-plan fast path, whose
+    # prepareForReuse() calls FactorizedTable::clear() on the root ResultCollector of
+    # the write. Write statements return no columns, so that FactorizedTable has an
+    # empty schema and never allocates its block collections; clear() dereferenced
+    # the null collection (SIGSEGV on 0.20.0). The vector similarity query in the
+    # original report was unrelated to the crash.
+    conn, _ = conn_db_readwrite
+    conn.execute(
+        "CREATE NODE TABLE Contribution(id STRING, embedding FLOAT[4], PRIMARY KEY(id))"
+    )
+    embeddings = {
+        "c1": [1.0, 0.0, 0.2, 0.0],
+        "c2": [0.0, 1.0, 0.0, 0.2],
+        "c3": [0.8, 0.0, 0.1, 0.0],
+    }
+    # Same parameterized query string executed repeatedly (fast path on every run
+    # but the first).
+    for node_id, embedding in embeddings.items():
+        result = conn.execute(
+            "CREATE (:Contribution {id: $id, embedding: $embedding})",
+            {"id": node_id, "embedding": embedding},
+        )
+        result.close()
+
+    result = conn.execute(
+        "MATCH (c:Contribution) RETURN c.id, ARRAY_COSINE_SIMILARITY(c.embedding, [1.0, 0.0, 0.2, 0.0])"
+        " AS sim ORDER BY c.id"
+    )
+    assert result.has_next()
+    assert result.get_next() == ["c1", pytest.approx(1.0)]
+    assert result.has_next()
+    assert result.get_next() == ["c2", pytest.approx(0.0)]
+    assert result.has_next()
+    assert 0.0 < result.get_next()[1] < 1.0
+    assert not result.has_next()
+    result.close()
+
+
+# TODO(Maxwell): check if we should change getCastCost() for the following test
+# def test_issue_3248(conn_db_readwrite: ConnDB) -> None:
+#     conn, _ = conn_db_readwrite
+#     # Define schema
+#     conn.execute("CREATE NODE TABLE Item(id UINT64, item STRING, price DOUBLE, vector DOUBLE[2], PRIMARY KEY (id))")
+#
+#     # Add data
+#     conn.execute("MERGE (a:Item {id: 1, item: 'apple', price: 2.0, vector: cast([3.1, 4.1], 'DOUBLE[2]')})")
+#     conn.execute("MERGE (b:Item {id: 2, item: 'banana', price: 1.0, vector: cast([5.9, 26.5], 'DOUBLE[2]')})")
+#
+#     # Run similarity search
+#     result = conn.execute("MATCH (a:Item) RETURN a.item, a.price,
+#               array_cosine_similarity(a.vector, [6.0, 25.0]) AS sim ORDER BY sim DESC")
+#     assert result.has_next()
+#     assert result.get_next() == [2]
+#     assert result.has_next()
+#     assert result.get_next() == [2]
+#     assert not result.has_next()
+#     result.close()
+
+
+def test_issue_1067_order_by_string_then_numeric(conn_db_readwrite: ConnDB) -> None:
+    # riag-rename:skip-next upstream provenance
+    # https://github.com/LadybugDB/ladybug/issues/1067
+    # KeyBlockMerger::compareTuplePtrWithStringCol ignored trailing keys once all
+    # STRING keys tied, misordering e.g. ORDER BY <STRING>, <numeric> when merging
+    # sorted key blocks (deterministic once the sort spills to multiple key blocks).
+    conn, _ = conn_db_readwrite
+    conn.execute(
+        "CREATE NODE TABLE Obs(id INT64, name STRING, value DOUBLE, PRIMARY KEY(id))"
+    )
+    conn.execute(
+        "COPY Obs FROM (UNWIND range(0, 19999) AS o RETURN o, "
+        "'item' + CAST(o % 3 AS STRING), CAST((o * 7919) % 100003 AS DOUBLE))"
+    )
+    result = conn.execute(
+        "MATCH (o:Obs) RETURN o.name, o.value ORDER BY o.name, o.value"
+    )
+    rows = result.get_all()
+    result.close()
+    # Fail loudly if ingestion ever changes: the bug only reproduces once the
+    # sort spills to multiple key blocks.
+    assert len(rows) == 20000
+    assert rows == sorted(rows)
