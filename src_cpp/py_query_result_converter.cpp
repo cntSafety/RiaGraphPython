@@ -56,8 +56,10 @@ void NPArrayWrapper::appendElement(Value* value) {
             ((float*)dataBuffer)[numElements] = value->getValue<float>();
         } break;
         case LogicalTypeID::DATE: {
+            // Microseconds straight from the day count. Going through nanoseconds overflows
+            // int64 for dates past the year 2262 and silently wraps to a wrong date.
             ((int64_t*)dataBuffer)[numElements] =
-                Date::getEpochNanoSeconds(value->getValue<date_t>()) / Interval::NANOS_PER_MICRO;
+                static_cast<int64_t>(value->getValue<date_t>().days) * Interval::MICROS_PER_DAY;
         } break;
         case LogicalTypeID::TIMESTAMP: {
             ((int64_t*)dataBuffer)[numElements] = value->getValue<timestamp_t>().value;

@@ -118,14 +118,42 @@ py::dict buildCSRResult(riag::main::ArrowQueryResult::CSRArrowArrays arrays) {
 
 } // namespace
 
-static py::object converTimestampToPyObject(timestamp_t& timestamp) {
+// Python's datetime only represents the years 1..9999, the engine's DATE and TIMESTAMP types reach
+// far beyond that. PyDate_FromDate and friends signal an out-of-range year by returning NULL with a
+// Python error set; wrapping that NULL in a py::object hands a null handle to the caller, which
+// crashes the interpreter as soon as the value is touched. So check the year up front and raise a
+// ValueError that names the engine value, and never let a NULL reach py::cast.
+static constexpr int32_t PY_DATETIME_MIN_YEAR = 1;
+static constexpr int32_t PY_DATETIME_MAX_YEAR = 9999;
+
+static void validatePyDatetimeYear(
+    int32_t year, const std::string& valueStr, const char* typeName) {
+    if (year < PY_DATETIME_MIN_YEAR || year > PY_DATETIME_MAX_YEAR) {
+        throw py::value_error(std::string(typeName) + " value " + valueStr +
+                              " is outside the range supported by Python's datetime (years " +
+                              std::to_string(PY_DATETIME_MIN_YEAR) + " to " +
+                              std::to_string(PY_DATETIME_MAX_YEAR) + ")");
+    }
+}
+
+// Takes ownership of a new reference returned by the CPython datetime constructors. A NULL result
+// (e.g. MemoryError) is rethrown as the Python error that is pending.
+static py::object stealPyDatetimeObject(PyObject* obj) {
+    if (obj == nullptr) {
+        throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::object>(obj);
+}
+
+static py::object converTimestampToPyObject(const timestamp_t& timestamp, const char* typeName) {
     int32_t year = 0, month = 0, day = 0, hour = 0, min = 0, sec = 0, micros = 0;
     date_t date;
     dtime_t time;
     Timestamp::convert(timestamp, date, time);
     Date::convert(date, year, month, day);
+    validatePyDatetimeYear(year, Timestamp::toString(timestamp), typeName);
     Time::convert(time, hour, min, sec, micros);
-    return py::cast<py::object>(
+    return stealPyDatetimeObject(
         PyDateTime_FromDateAndTime(year, month, day, hour, min, sec, micros));
 }
 
@@ -200,11 +228,12 @@ py::object PyQueryResult::convertValueToPyObject(const Value& value) {
         auto dateVal = value.getValue<date_t>();
         int32_t year = 0, month = 0, day = 0;
         Date::convert(dateVal, year, month, day);
-        return py::cast<py::object>(PyDate_FromDate(year, month, day));
+        validatePyDatetimeYear(year, Date::toString(dateVal), "DATE");
+        return stealPyDatetimeObject(PyDate_FromDate(year, month, day));
     }
     case LogicalTypeID::TIMESTAMP: {
         auto timestampVal = value.getValue<timestamp_t>();
-        return converTimestampToPyObject(timestampVal);
+        return converTimestampToPyObject(timestampVal, "TIMESTAMP");
     }
     case LogicalTypeID::TIMESTAMP_TZ: {
         auto timestampVal = value.getValue<timestamp_tz_t>();
@@ -213,25 +242,26 @@ py::object PyQueryResult::convertValueToPyObject(const Value& value) {
         dtime_t time;
         Timestamp::convert(timestampVal, date, time);
         Date::convert(date, year, month, day);
+        validatePyDatetimeYear(year, Timestamp::toString(timestampVal), "TIMESTAMP_TZ");
         Time::convert(time, hour, min, sec, micros);
 
-        return py::cast<py::object>(PyDateTimeTZ_FromDateAndTime(year, month, day, hour, min, sec,
+        return stealPyDatetimeObject(PyDateTimeTZ_FromDateAndTime(year, month, day, hour, min, sec,
             micros, PyDateTime_TimeZone_UTC));
     }
     case LogicalTypeID::TIMESTAMP_NS: {
         timestamp_t timestampVal =
             Timestamp::fromEpochNanoSeconds(value.getValue<timestamp_ns_t>().value);
-        return converTimestampToPyObject(timestampVal);
+        return converTimestampToPyObject(timestampVal, "TIMESTAMP_NS");
     }
     case LogicalTypeID::TIMESTAMP_MS: {
         timestamp_t timestampVal =
             Timestamp::fromEpochMilliSeconds(value.getValue<timestamp_ms_t>().value);
-        return converTimestampToPyObject(timestampVal);
+        return converTimestampToPyObject(timestampVal, "TIMESTAMP_MS");
     }
     case LogicalTypeID::TIMESTAMP_SEC: {
         timestamp_t timestampVal =
             Timestamp::fromEpochSeconds(value.getValue<timestamp_sec_t>().value);
-        return converTimestampToPyObject(timestampVal);
+        return converTimestampToPyObject(timestampVal, "TIMESTAMP_SEC");
     }
     case LogicalTypeID::INTERVAL: {
         auto intervalVal = value.getValue<interval_t>();

@@ -7,13 +7,15 @@ import ctypes.util
 import datetime as dt
 import os
 import sys
-import threading
 import uuid
 import weakref
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class _RiaGSystemConfig(ctypes.Structure):
@@ -923,9 +925,35 @@ def _logical_type_to_str(logical_type: _RiaGLogicalType) -> str:
     return _TYPE_ID_TO_NAME.get(type_id, f"UNKNOWN({type_id})")
 
 
-def _to_datetime_from_micros(value: int, *, tz_aware: bool = False) -> dt.datetime:
-    seconds = value / 1_000_000
-    utc_dt = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
+_EPOCH_UTC = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def _out_of_range_error(type_name: str, detail: str) -> ValueError:
+    # The engine's DATE and TIMESTAMP types reach far beyond the years 1..9999 that
+    # datetime can hold. Python's own errors for that (ValueError, OverflowError or,
+    # from fromtimestamp, OSError) never name the value, so re-raise one uniform
+    # ValueError that does -- the same one the pybind backend raises.
+    return ValueError(
+        f"{type_name} value {detail} is outside the range supported by "
+        "Python's datetime (years 1 to 9999)"
+    )
+
+
+def _to_datetime_from_micros(
+    value: int,
+    *,
+    tz_aware: bool = False,
+    type_name: str = "TIMESTAMP",
+    render: Callable[[], str] | None = None,
+) -> dt.datetime:
+    # Epoch-relative arithmetic on a timedelta: unlike fromtimestamp it has no
+    # platform-dependent lower bound (Windows rejects negative values) and does not
+    # round through a float, so every in-range value converts exactly.
+    try:
+        utc_dt = _EPOCH_UTC + dt.timedelta(microseconds=value)
+    except (OverflowError, ValueError, OSError) as exc:
+        detail = render() if render else f"{value} microseconds since epoch"
+        raise _out_of_range_error(type_name, detail) from exc
     if tz_aware:
         return utc_dt
     return utc_dt.replace(tzinfo=None)
@@ -1324,6 +1352,9 @@ class QueryResult:
         self._owned_string_ptrs.append(ptr)
         raw = ctypes.cast(ptr, ctypes.c_char_p).value or b""
         return raw.decode("utf-8", errors="replace")
+
+    def _render_value(self, value: _RiaGValue) -> str:
+        return self._adopt_c_string(_LIB.riag_value_to_string(ctypes.byref(value)))
 
     def _adopt_blob(self, ptr: ctypes.POINTER(ctypes.c_uint8), length: int) -> bytes:
         if not ptr:
@@ -1804,7 +1835,10 @@ class QueryResult:
                     _LIB.riag_value_get_date(ctypes.byref(value), ctypes.byref(out)),
                     "Failed to read date",
                 )
-                return dt.date(1970, 1, 1) + dt.timedelta(days=int(out.days))
+                try:
+                    return dt.date(1970, 1, 1) + dt.timedelta(days=int(out.days))
+                except (OverflowError, ValueError) as exc:
+                    raise _out_of_range_error("DATE", self._render_value(value)) from exc
             if type_id == _RIAG_TIMESTAMP:
                 out = _RiaGTimestamp()
                 _check_state(
@@ -1813,7 +1847,11 @@ class QueryResult:
                     ),
                     "Failed to read timestamp",
                 )
-                return _to_datetime_from_micros(int(out.value))
+                return _to_datetime_from_micros(
+                    int(out.value),
+                    type_name="TIMESTAMP",
+                    render=lambda: self._render_value(value),
+                )
             if type_id == _RIAG_TIMESTAMP_TZ:
                 out = _RiaGTimestamp()
                 _check_state(
@@ -1822,7 +1860,12 @@ class QueryResult:
                     ),
                     "Failed to read timestamp_tz",
                 )
-                return _to_datetime_from_micros(int(out.value), tz_aware=True)
+                return _to_datetime_from_micros(
+                    int(out.value),
+                    tz_aware=True,
+                    type_name="TIMESTAMP_TZ",
+                    render=lambda: self._render_value(value),
+                )
             if type_id == _RIAG_TIMESTAMP_MS:
                 out = _RiaGTimestamp()
                 _check_state(
@@ -1831,9 +1874,11 @@ class QueryResult:
                     ),
                     "Failed to read timestamp_ms",
                 )
-                return dt.datetime.fromtimestamp(
-                    int(out.value) / 1000, tz=dt.timezone.utc
-                ).replace(tzinfo=None)
+                return _to_datetime_from_micros(
+                    int(out.value) * 1000,
+                    type_name="TIMESTAMP_MS",
+                    render=lambda: self._render_value(value),
+                )
             if type_id == _RIAG_TIMESTAMP_SEC:
                 out = _RiaGTimestamp()
                 _check_state(
@@ -1842,9 +1887,11 @@ class QueryResult:
                     ),
                     "Failed to read timestamp_sec",
                 )
-                return dt.datetime.fromtimestamp(
-                    int(out.value), tz=dt.timezone.utc
-                ).replace(tzinfo=None)
+                return _to_datetime_from_micros(
+                    int(out.value) * 1_000_000,
+                    type_name="TIMESTAMP_SEC",
+                    render=lambda: self._render_value(value),
+                )
             if type_id == _RIAG_TIMESTAMP_NS:
                 out = _RiaGTimestamp()
                 _check_state(
@@ -1853,9 +1900,15 @@ class QueryResult:
                     ),
                     "Failed to read timestamp_ns",
                 )
-                return dt.datetime.fromtimestamp(
-                    int(out.value) / 1_000_000_000, tz=dt.timezone.utc
-                ).replace(tzinfo=None)
+                # Truncate toward zero, as the engine does when it narrows
+                # nanoseconds to microseconds.
+                nanos = int(out.value)
+                micros = abs(nanos) // 1000 * (1 if nanos >= 0 else -1)
+                return _to_datetime_from_micros(
+                    micros,
+                    type_name="TIMESTAMP_NS",
+                    render=lambda: self._render_value(value),
+                )
             if type_id == _RIAG_INTERVAL:
                 out = _RiaGInterval()
                 _check_state(
@@ -2195,7 +2248,6 @@ class QueryResult:
 class Connection:
     def __init__(self, database: Database, num_threads: int = 0):
         self._connection = _RiaGConnection()
-        self._query_timeout_ms = 0
         _check_state(
             _LIB.riag_connection_init(
                 ctypes.byref(database._database), ctypes.byref(self._connection)
@@ -2229,33 +2281,16 @@ class Connection:
             ),
             "Failed to set query timeout",
         )
-        self._query_timeout_ms = int(timeout_in_ms)
 
     def interrupt(self) -> None:
         _LIB.riag_connection_interrupt(ctypes.byref(self._connection))
 
-    def _call_with_timeout(self, callback: Any) -> Any:
-        timer = None
-        if self._query_timeout_ms > 0:
-            timer = threading.Timer(
-                min(self._query_timeout_ms / 1000, 0.01), self.interrupt
-            )
-            timer.daemon = True
-            timer.start()
-        try:
-            return callback()
-        finally:
-            if timer is not None:
-                timer.cancel()
-
     def query(self, query: str) -> QueryResult:
         result = _RiaGQueryResult()
-        state = self._call_with_timeout(
-            lambda: _LIB.riag_connection_query(
-                ctypes.byref(self._connection),
-                query.encode("utf-8"),
-                ctypes.byref(result),
-            )
+        state = _LIB.riag_connection_query(
+            ctypes.byref(self._connection),
+            query.encode("utf-8"),
+            ctypes.byref(result),
         )
 
         # Query failures are commonly surfaced on QueryResult itself (isSuccess + getErrorMessage).
@@ -2289,12 +2324,10 @@ class Connection:
         if parameters:
             prepared_statement.bind_parameters(parameters)
         result = _RiaGQueryResult()
-        state = self._call_with_timeout(
-            lambda: _LIB.riag_connection_execute(
-                ctypes.byref(self._connection),
-                ctypes.byref(prepared_statement._prepared),
-                ctypes.byref(result),
-            )
+        state = _LIB.riag_connection_execute(
+            ctypes.byref(self._connection),
+            ctypes.byref(prepared_statement._prepared),
+            ctypes.byref(result),
         )
 
         if state != _RIAG_SUCCESS and not result._query_result:

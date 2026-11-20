@@ -410,7 +410,6 @@ class Connection:
         self._calls = threading.Condition()
         self._calls_in_flight = 0
         self._prefer_pybind = False
-        self._query_timeout_ms = 0
         self._query_results: WeakSet[QueryResult] = WeakSet()
         self._capi_scan_tables: set[str] = set()
         # Implicit prepared-statement cache, shared by the pybind and
@@ -491,7 +490,12 @@ class Connection:
         while the connection runs a query, close() raises instead.
         """
         if any(x is self for x in _active_stack()):
-            msg = "close() cannot be called from a call on the same connection."
+            # A UDF runs on the thread of the call that started its query, so
+            # that call is on the stack below it; say which of the two it is.
+            if _called_from_udf(self):
+                msg = "close() cannot be called from a UDF while the connection runs a query."
+            else:
+                msg = "close() cannot be called from a call on the same connection."
             raise RuntimeError(msg)
 
         with self._calls:
@@ -985,15 +989,6 @@ class Connection:
             query, parameters = self._rewrite_capi_python_scan(query, parameters)
         scan_tables_to_drop = self._capi_scan_tables - scan_tables_before
 
-        if (
-            not self._using_pybind_backend()
-            and self._query_timeout_ms > 0
-            and isinstance(query, str)
-            and len(re.findall(r"(?i)\bUNWIND\s+RANGE\s*\(", query)) >= 2
-        ):
-            msg = "Interrupted."
-            raise RuntimeError(msg)
-
         if self._using_pybind_backend():
             if isinstance(query, str):
                 query_result_internal = self._execute_with_pybind(query, parameters)
@@ -1193,7 +1188,6 @@ class Connection:
 
         """
         self.init_connection()
-        self._query_timeout_ms = int(timeout_in_ms)
         self._connection.set_query_timeout(timeout_in_ms)
 
     def interrupt(self) -> None:
